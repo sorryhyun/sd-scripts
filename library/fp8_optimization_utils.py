@@ -480,3 +480,97 @@ def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
 
     logger.info(f"Number of monkey-patched Linear layers: {patched_count}")
     return model
+
+
+# =============================================================================
+# MXFP8 (ComfyUI quantized checkpoint) support
+# =============================================================================
+
+
+def _dequantize_mxfp8_weight(weight_fp8: torch.Tensor, block_scales_raw: torch.Tensor, output_dtype: torch.dtype) -> torch.Tensor:
+    """Dequantize a single MXFP8 weight tensor to the target dtype.
+
+    Args:
+        weight_fp8: FP8 E4M3 weight tensor of shape (rows, cols)
+        block_scales_raw: E8M0 block scales in swizzled cuBLAS layout (stored as uint8)
+        output_dtype: Target dtype (e.g., torch.bfloat16)
+    """
+    from comfy_kitchen.backends.eager.quantization import dequantize_mxfp8
+
+    return dequantize_mxfp8(weight_fp8, block_scales_raw, output_type=output_dtype)
+
+
+def process_mxfp8_state_dict(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Process a ComfyUI MXFP8-quantized state dict for training.
+
+    Strips ``comfy_quant`` metadata keys and renames ``weight_scale`` to
+    ``mxfp8_scale`` so that :func:`apply_mxfp8_monkey_patch` can register
+    them as buffers.
+
+    Returns the modified state dict (in-place).
+    """
+    import json
+
+    # 1. Strip comfy_quant metadata
+    comfy_quant_keys = [k for k in sd if k.endswith(".comfy_quant")]
+    for key in comfy_quant_keys:
+        meta = json.loads(sd.pop(key).numpy().tobytes())
+        fmt = meta.get("format", "unknown")
+        if fmt != "mxfp8":
+            raise ValueError(f"Unsupported comfy_quant format: {fmt} (only mxfp8 is supported)")
+
+    # 2. Rename weight_scale → mxfp8_scale
+    weight_scale_keys = [k for k in sd if k.endswith(".weight_scale")]
+    for key in weight_scale_keys:
+        new_key = key.replace(".weight_scale", ".mxfp8_scale")
+        sd[new_key] = sd.pop(key)
+
+    logger.info(f"Processed MXFP8 state dict: stripped {len(comfy_quant_keys)} comfy_quant keys, "
+                f"renamed {len(weight_scale_keys)} weight_scale → mxfp8_scale")
+    return sd
+
+
+def mxfp8_linear_forward_patch(self: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+    """Patched forward for MXFP8-quantized Linear layers.
+
+    Dequantizes the FP8 weight to bf16 on each forward call, keeping the
+    stored weight in FP8 to save VRAM.
+    """
+    dequantized_weight = _dequantize_mxfp8_weight(self.weight, self.mxfp8_scale, x.dtype)
+    return F.linear(x, dequantized_weight, self.bias)
+
+
+def apply_mxfp8_monkey_patch(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> nn.Module:
+    """Monkey-patch Linear layers to use MXFP8 dequantize-on-forward.
+
+    Expects ``state_dict`` to have been processed by :func:`process_mxfp8_state_dict`
+    (i.e., ``*.mxfp8_scale`` keys present).
+    """
+    scale_keys = [k for k in state_dict if k.endswith(".mxfp8_scale")]
+
+    patched_paths = set()
+    scale_shapes = {}
+    for key in scale_keys:
+        module_path = key.rsplit(".mxfp8_scale", 1)[0]
+        patched_paths.add(module_path)
+        scale_shapes[module_path] = state_dict[key].shape
+
+    patched_count = 0
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and name in patched_paths:
+            # Register buffer so load_state_dict can assign the scale tensor
+            module.register_buffer("mxfp8_scale", torch.empty(scale_shapes[name], dtype=torch.uint8))
+
+            def new_forward(self, x):
+                return mxfp8_linear_forward_patch(self, x)
+
+            module.forward = new_forward.__get__(module, type(module))
+            patched_count += 1
+
+    logger.info(f"MXFP8 monkey-patched {patched_count} Linear layers")
+    return model
+
+
+def is_mxfp8_checkpoint(sd: dict[str, torch.Tensor]) -> bool:
+    """Check if a state dict contains MXFP8 quantization keys."""
+    return any(k.endswith(".comfy_quant") for k in sd)

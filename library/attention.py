@@ -16,10 +16,27 @@ except ImportError:
     flash_attn_func = None
 
 try:
+    from flash_attn.cute import flash_attn_func as flash4_attn_func
+except ImportError:
+    flash4_attn_func = None
+
+try:
+    from flash_attn_interface import flash_attn_func as flash3_attn_func
+    from flash_attn_interface import flash_attn_varlen_func as flash3_attn_varlen_func
+except ImportError:
+    flash3_attn_func = None
+    flash3_attn_varlen_func = None
+
+try:
     from sageattention import sageattn_varlen, sageattn
 except ImportError:
     sageattn_varlen = None
     sageattn = None
+
+try:
+    from sageattn3 import sageattn3_blackwell
+except ImportError:
+    sageattn3_blackwell = None
 
 try:
     import xformers.ops as xops
@@ -40,7 +57,7 @@ class AttentionParams:
 
     @property
     def supports_fp32(self) -> bool:
-        return self.attn_mode not in ["flash"]
+        return self.attn_mode not in ["flash", "flash3", "flash4", "sageattn3"]
 
     @property
     def requires_same_dtype(self) -> bool:
@@ -136,7 +153,7 @@ def attention(
             seqlen_trimmed = True
 
     # Determine tensor layout based on attention implementation
-    if attn_params.attn_mode == "torch" or (
+    if attn_params.attn_mode == "torch" or attn_params.attn_mode == "sageattn3" or (
         attn_params.attn_mode == "sageattn" and (attn_params.split_attn or attn_params.cu_seqlens is None)
     ):
         transpose_fn = lambda x: x.transpose(1, 2)  # [B, H, L, D] for SDPA and sageattn with fixed length
@@ -228,6 +245,21 @@ def attention(
             # Reshape x with shape [(bxs), a, d] to [b, s, a, d]
             x = x.view(batch_size, seqlen, x.shape[-2], x.shape[-1])  # B, L, H, D
 
+    elif attn_params.attn_mode == "sageattn3":
+        if attn_params.split_attn:
+            x = []
+            for i in range(len(q)):
+                x_i = sageattn3_blackwell(q[i], k[i], v[i], is_causal=False)  # B, H, L, D. No dropout support
+                q[i] = None
+                k[i] = None
+                v[i] = None
+                x.append(pad_fn(x_i, attn_params.max_seqlen))  # B, H, L, D
+            x = torch.cat(x, dim=0)
+            del q, k, v
+        else:
+            x = sageattn3_blackwell(q, k, v, is_causal=False)  # B, H, L, D. No dropout support
+            del q, k, v
+
     elif attn_params.attn_mode == "flash":
         if attn_params.split_attn:
             x = []
@@ -260,8 +292,64 @@ def attention(
             # Reshape x with shape [(bxs), a, d] to [b, s, a, d]
             x = x.view(batch_size, seqlen, x.shape[-2], x.shape[-1])  # B, L, H, D
 
+    elif attn_params.attn_mode == "flash3":
+        # Flash Attention 3 (flash_attn_interface) — no dropout support
+        if attn_params.split_attn:
+            x = []
+            for i in range(len(q)):
+                x_i = flash3_attn_func(q[i], k[i], v[i], softmax_scale=scale)  # B, L, H, D
+                q[i] = None
+                k[i] = None
+                v[i] = None
+                x.append(pad_fn(x_i, attn_params.max_seqlen))  # B, L, H, D
+            x = torch.cat(x, dim=0)
+            del q, k, v
+        elif attn_params.cu_seqlens is None:  # all tokens are valid
+            x = flash3_attn_func(q, k, v, softmax_scale=scale)  # B, L, H, D
+            del q, k, v
+        else:
+            # Reshape to [(bxs), a, d]
+            batch_size, seqlen = q.shape[0], q.shape[1]
+            q = q.view(q.shape[0] * q.shape[1], *q.shape[2:])  # [B*L, H, D]
+            k = k.view(k.shape[0] * k.shape[1], *k.shape[2:])  # [B*L, H, D]
+            v = v.view(v.shape[0] * v.shape[1], *v.shape[2:])  # [B*L, H, D]
+
+            x = flash3_attn_varlen_func(
+                q, k, v, attn_params.cu_seqlens, attn_params.cu_seqlens, attn_params.max_seqlen, attn_params.max_seqlen,
+                softmax_scale=scale,
+            )
+            del q, k, v
+
+            x = x.view(batch_size, seqlen, x.shape[-2], x.shape[-1])  # B, L, H, D
+
+    elif attn_params.attn_mode == "flash4":
+        if attn_params.split_attn:
+            x = []
+            for i in range(len(q)):
+                x_i = flash4_attn_func(q[i], k[i], v[i], softmax_scale=scale)  # B, L, H, D
+                q[i] = None
+                k[i] = None
+                v[i] = None
+                x.append(pad_fn(x_i, attn_params.max_seqlen))  # B, L, H, D
+            x = torch.cat(x, dim=0)
+            del q, k, v
+        elif attn_params.cu_seqlens is None:  # all tokens are valid
+            x = flash4_attn_func(q, k, v, softmax_scale=scale)  # B, L, H, D
+            del q, k, v
+        else:
+            # flash4 has no varlen support; fall back to split per batch element
+            batch_size = q.shape[0]
+            x = []
+            for i in range(batch_size):
+                seqlen_i = attn_params.seqlens[i].item()
+                x_i = flash4_attn_func(
+                    q[i : i + 1, :seqlen_i], k[i : i + 1, :seqlen_i], v[i : i + 1, :seqlen_i], softmax_scale=scale
+                )
+                x.append(pad_fn(x_i, attn_params.max_seqlen))
+            x = torch.cat(x, dim=0)
+            del q, k, v
+
     else:
-        # Currently only PyTorch SDPA and xformers are implemented
         raise ValueError(f"Unsupported attention mode: {attn_params.attn_mode}")
 
     x = transpose_fn(x)  # [B, L, H, D]

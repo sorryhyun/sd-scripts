@@ -1468,7 +1468,8 @@ class Anima(nn.Module):
             crossattn_mask = source_attention_mask
 
         # Trim padded positions for efficient cross-attention across all DiT blocks
-        if crossattn_mask is not None:
+        # Skip when compiling — dynamic trim causes graph breaks, and padding is already zeroed above
+        if crossattn_mask is not None and not torch.compiler.is_compiling():
             max_actual_len = int(crossattn_mask.sum(dim=-1).max().item())
             if 0 < max_actual_len < context.shape[1]:
                 context = context[:, :max_actual_len]
@@ -1612,7 +1613,7 @@ class LLMAdapterAttention(nn.Module):
             out_packed = attention.flash_attn_varlen_func(
                 q_packed, k_packed, v_packed,
                 cu_seqlens_q, cu_seqlens_kv,
-                q_seqlens.max().item(), kv_seqlens.max().item(),
+                L_q, L_kv,
             )
 
             # Unpack: [total_valid_q, H, D] → [B, L_q, H, D]

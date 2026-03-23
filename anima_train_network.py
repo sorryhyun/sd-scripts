@@ -116,7 +116,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         return "anima", [qwen3_text_encoder], vae, None  # unet loaded lazily
 
     def load_unet_lazily(self, args, weight_dtype, accelerator, text_encoders) -> tuple[nn.Module, list[nn.Module]]:
-        loading_dtype = None if args.fp8_scaled else weight_dtype
+        loading_dtype = None if (args.fp8_scaled or getattr(args, "mxfp8_base", False)) else weight_dtype
         loading_device = "cpu" if self.is_swapping_blocks else accelerator.device
 
         attn_mode = "torch"
@@ -137,6 +137,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             loading_dtype,
             args.fp8_scaled,
             attn_softmax_scale=attn_softmax_scale,
+            mxfp8_base=getattr(args, "mxfp8_base", False),
         )
 
         # Store unsloth preference so that when the base NetworkTrainer calls
@@ -532,6 +533,11 @@ def setup_parser() -> argparse.ArgumentParser:
     train_util.add_dit_training_arguments(parser)
     anima_train_utils.add_anima_training_arguments(parser)
     # parser.add_argument("--fp8_scaled", action="store_true", help="Use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う")
+    parser.add_argument(
+        "--mxfp8_base",
+        action="store_true",
+        help="Load MXFP8 (ComfyUI-quantized) checkpoint. Weights stay in FP8 and are dequantized on each forward pass to save VRAM.",
+    )
     parser.add_argument(
         "--unsloth_offload_checkpointing",
         action="store_true",

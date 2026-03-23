@@ -8,7 +8,7 @@ from safetensors import safe_open
 from accelerate.utils import set_module_tensor_to_device  # kept for potential future use
 from accelerate import init_empty_weights
 
-from library.fp8_optimization_utils import apply_fp8_monkey_patch
+from library.fp8_optimization_utils import apply_fp8_monkey_patch, is_mxfp8_checkpoint, process_mxfp8_state_dict, apply_mxfp8_monkey_patch
 from library.lora_utils import load_safetensors_with_lora_and_fp8
 from library import anima_models
 from library.safetensors_utils import WeightTransformHooks
@@ -41,6 +41,7 @@ def load_anima_model(
     lora_weights_list: Optional[List[Dict[str, torch.Tensor]]] = None,
     lora_multipliers: Optional[list[float]] = None,
     attn_softmax_scale: Optional[float] = None,
+    mxfp8_base: bool = False,
 ) -> anima_models.Anima:
     """
     Load Anima model from the specified checkpoint.
@@ -126,6 +127,18 @@ def load_anima_model(
         if loading_device.type != "cpu":
             # make sure all the model weights are on the loading_device
             logger.info(f"Moving weights to {loading_device}")
+            for key in sd.keys():
+                sd[key] = sd[key].to(loading_device)
+
+    # MXFP8 support: detect and process ComfyUI MXFP8-quantized checkpoints
+    if mxfp8_base or is_mxfp8_checkpoint(sd):
+        if not mxfp8_base:
+            logger.warning("Detected MXFP8 checkpoint but --mxfp8_base was not set. Enabling MXFP8 mode automatically.")
+        process_mxfp8_state_dict(sd)
+        apply_mxfp8_monkey_patch(model, sd)
+
+        if loading_device.type != "cpu":
+            logger.info(f"Moving MXFP8 weights to {loading_device}")
             for key in sd.keys():
                 sd[key] = sd[key].to(loading_device)
 
